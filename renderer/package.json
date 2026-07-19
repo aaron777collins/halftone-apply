@@ -1,0 +1,16 @@
+{
+  "name": "halftone-renderer",
+  "version": "1.0.0",
+  "description": "Offline exact-match renderer for the Halftone comic-stylization tuner (runs the same WebGL pipeline via headless Chromium and encodes an MP4).",
+  "main": "render.js",
+  "scripts": {
+    "render": "node render.js"
+  },
+  "keywords": ["halftone", "comic", "webgl", "ffmpeg", "puppeteer"],
+  "author": "aaron777collins",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "puppeteer": "^25.3.0"
+  }
+}

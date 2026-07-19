@@ -11,6 +11,10 @@
 *.gif
 *.webp
 
+# Node / puppeteer (never commit dependencies or bundled Chromium)
+node_modules/
+renderer/node_modules/
+
 # Temp / editor / OS cruft
 *.tmp
 *.log

@@ -1,0 +1,229 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Halftone offline renderer</title></head>
+<body>
+<canvas id="gl"></canvas>
+<script>
+/* =========================================================================
+   Halftone offline renderer page.
+
+   This reproduces the EXACT WebGL comic-stylization pipeline from the
+   "Halftone" tuner (index.html) so that an offline render is pixel-faithful
+   to the tuner's on-screen preview. Shaders, pass order, uniform values and
+   scalings, u_flip handling, and the 1100px processing cap are copied
+   verbatim from the tuner.
+
+   Node (render.js, via puppeteer) calls:
+     window.HT.init(w, h, config)   -> set up GL at proc w/h with settings
+     window.HT.process(dataURL)     -> upload one frame, run pipeline,
+                                       return a top-down PNG data URL
+   ========================================================================= */
+
+const canvas = document.getElementById('gl');
+// Same context flags as the tuner.
+const gl = canvas.getContext('webgl', {preserveDrawingBuffer:true, premultipliedAlpha:false});
+if(!gl){ throw new Error('WebGL is not available in this browser/headless context.'); }
+
+/* ---------------- shaders (verbatim from tuner) ---------------- */
+const VS = `
+attribute vec2 a_pos; varying vec2 v_uv;
+uniform float u_flip;
+void main(){ v_uv = vec2(a_pos.x*0.5+0.5, (a_pos.y*u_flip)*0.5+0.5);
+  gl_Position = vec4(a_pos,0.0,1.0); }`;
+
+const FS_EQ = `precision highp float; varying vec2 v_uv;
+uniform sampler2D u_tex; uniform float u_sat,u_con;
+void main(){ vec3 c=texture2D(u_tex,v_uv).rgb;
+  c=(c-0.5)*u_con+0.5;
+  float l=dot(c,vec3(0.299,0.587,0.114));
+  c=mix(vec3(l),c,u_sat);
+  gl_FragColor=vec4(clamp(c,0.0,1.0),1.0); }`;
+
+const FS_BIL = `precision highp float; varying vec2 v_uv;
+uniform sampler2D u_tex; uniform vec2 u_texel; uniform int u_R; uniform float u_sigR;
+void main(){
+  vec3 ctr=texture2D(u_tex,v_uv).rgb;
+  float sigS=max(float(u_R)*0.6,0.6);
+  vec3 sum=vec3(0.0); float wsum=0.0;
+  for(int dy=-6;dy<=6;dy++){ for(int dx=-6;dx<=6;dx++){
+    if(dx< -u_R||dx>u_R||dy< -u_R||dy>u_R) continue;
+    vec2 off=vec2(float(dx),float(dy))*u_texel;
+    vec3 s=texture2D(u_tex,v_uv+off).rgb;
+    float ds=float(dx*dx+dy*dy);
+    float ws=exp(-ds/(2.0*sigS*sigS));
+    vec3 d=s-ctr; float dr=dot(d,d);
+    float wr=exp(-dr/(2.0*u_sigR*u_sigR));
+    float w=ws*wr; sum+=s*w; wsum+=w;
+  }}
+  gl_FragColor=vec4(sum/max(wsum,1e-4),1.0); }`;
+
+const FS_COMP = `precision highp float; varying vec2 v_uv;
+uniform sampler2D u_tex; uniform vec2 u_texel;
+uniform float u_levels; uniform bool u_edges; uniform float u_thr; uniform int u_thick; uniform float u_op;
+float luma(vec3 c){ return dot(c,vec3(0.299,0.587,0.114)); }
+float sob(vec2 uv){
+  float tl=luma(texture2D(u_tex,uv+u_texel*vec2(-1.0,-1.0)).rgb);
+  float tc=luma(texture2D(u_tex,uv+u_texel*vec2( 0.0,-1.0)).rgb);
+  float tr=luma(texture2D(u_tex,uv+u_texel*vec2( 1.0,-1.0)).rgb);
+  float ml=luma(texture2D(u_tex,uv+u_texel*vec2(-1.0, 0.0)).rgb);
+  float mr=luma(texture2D(u_tex,uv+u_texel*vec2( 1.0, 0.0)).rgb);
+  float bl=luma(texture2D(u_tex,uv+u_texel*vec2(-1.0, 1.0)).rgb);
+  float bc=luma(texture2D(u_tex,uv+u_texel*vec2( 0.0, 1.0)).rgb);
+  float br=luma(texture2D(u_tex,uv+u_texel*vec2( 1.0, 1.0)).rgb);
+  float gx=-tl-2.0*ml-bl+tr+2.0*mr+br;
+  float gy=-tl-2.0*tc-tr+bl+2.0*bc+br;
+  return length(vec2(gx,gy)); }
+void main(){
+  vec3 c=texture2D(u_tex,v_uv).rgb;
+  float L=max(u_levels,2.0);
+  float Y=dot(c,vec3(0.299,0.587,0.114));
+  float Cb=c.b-Y, Cr=c.r-Y;
+  Y=floor(min(Y,0.99999)*L)/(L-1.0);
+  float step=1.0/L;
+  Cb=floor(Cb/step+0.5)*step;
+  Cr=floor(Cr/step+0.5)*step;
+  c=vec3(Y+Cr, Y-0.5094*Cr-0.1942*Cb, Y+Cb);
+  c=clamp(c,0.0,1.0);
+  if(u_edges){
+    float e=0.0;
+    for(int dy=-3;dy<=3;dy++){ for(int dx=-3;dx<=3;dx++){
+      if(dx< -u_thick||dx>u_thick||dy< -u_thick||dy>u_thick) continue;
+      e=max(e,sob(v_uv+vec2(float(dx),float(dy))*u_texel));
+    }}
+    float line=smoothstep(u_thr,u_thr+0.06,e);
+    c=mix(c,vec3(0.0),line*u_op);
+  }
+  gl_FragColor=vec4(c,1.0); }`;
+
+const FS_COPY = `precision highp float; varying vec2 v_uv;
+uniform sampler2D u_tex; void main(){ gl_FragColor=texture2D(u_tex,v_uv); }`;
+
+function compile(type,src){ const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+function program(fs){ const p=gl.createProgram();
+  gl.attachShader(p,compile(gl.VERTEX_SHADER,VS)); gl.attachShader(p,compile(gl.FRAGMENT_SHADER,fs));
+  gl.bindAttribLocation(p,0,'a_pos'); gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p)); return p; }
+
+let P={};
+P.eq=program(FS_EQ); P.bil=program(FS_BIL); P.comp=program(FS_COMP); P.copy=program(FS_COPY);
+const buf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1, 1,-1, -1,1, 1,1]),gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+
+/* ---------------- textures / fbos (verbatim) ---------------- */
+let PW=0,PH=0, srcTex=null, fboA=null, fboB=null;
+function makeTex(w,h){ const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE); return t; }
+function makeFbo(w,h){ const tex=makeTex(w,h); const fb=gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null); return {fb,tex}; }
+
+/* Same as tuner resize() but width/height are already the capped proc size. */
+function setup(w,h){
+  PW=w; PH=h;
+  canvas.width=PW; canvas.height=PH;
+  srcTex=makeTex(PW,PH); fboA=makeFbo(PW,PH); fboB=makeFbo(PW,PH);
+}
+
+/* uploadSource — identical to tuner (UNPACK_FLIP_Y_WEBGL=false, RGBA/UNSIGNED_BYTE). */
+function uploadSource(el){ gl.bindTexture(gl.TEXTURE_2D,srcTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,el); }
+
+/* ---------------- draw ---------------- */
+function drawQuad(){ gl.drawArrays(gl.TRIANGLE_STRIP,0,4); }
+function useTex(prog,tex,unit){ gl.activeTexture(gl.TEXTURE0+unit); gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.uniform1i(gl.getUniformLocation(prog,'u_tex'),unit); }
+
+// Current settings (favorite defaults). Set by HT.init.
+let CFG={ sat:1.60, con:1.55, rad:6, pass:2, lev:12, thr:0.80, thick:1, op:0.85, edges:true };
+
+/* pipeline() — verbatim pass order and uniforms from the tuner. */
+function pipeline(){
+  const v=CFG;
+  gl.viewport(0,0,PW,PH);
+  const texel=[1/PW,1/PH];
+
+  // pass 1: eq -> fboA
+  gl.useProgram(P.eq); gl.uniform1f(gl.getUniformLocation(P.eq,'u_flip'),1);
+  useTex(P.eq,srcTex,0);
+  gl.uniform1f(gl.getUniformLocation(P.eq,'u_sat'),v.sat);
+  gl.uniform1f(gl.getUniformLocation(P.eq,'u_con'),v.con);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fboA.fb); drawQuad();
+
+  // bilateral ping-pong
+  let cur=fboA, other=fboB;
+  const passes=(v.rad>0)?v.pass:0;
+  for(let i=0;i<passes;i++){
+    gl.useProgram(P.bil); gl.uniform1f(gl.getUniformLocation(P.bil,'u_flip'),1);
+    useTex(P.bil,cur.tex,0);
+    gl.uniform2f(gl.getUniformLocation(P.bil,'u_texel'),texel[0],texel[1]);
+    gl.uniform1i(gl.getUniformLocation(P.bil,'u_R'),v.rad);
+    gl.uniform1f(gl.getUniformLocation(P.bil,'u_sigR'),0.14);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,other.fb); drawQuad();
+    const t=cur;cur=other;other=t;
+  }
+
+  // composite -> screen (flip Y: screen origin top-left, GL texture bottom-left)
+  gl.useProgram(P.comp); gl.uniform1f(gl.getUniformLocation(P.comp,'u_flip'),-1);
+  useTex(P.comp,cur.tex,0);
+  gl.uniform2f(gl.getUniformLocation(P.comp,'u_texel'),texel[0],texel[1]);
+  gl.uniform1f(gl.getUniformLocation(P.comp,'u_levels'),v.lev);
+  gl.uniform1i(gl.getUniformLocation(P.comp,'u_edges'),v.edges?1:0);
+  gl.uniform1f(gl.getUniformLocation(P.comp,'u_thr'),v.thr*4.0); // scale sobel range
+  gl.uniform1i(gl.getUniformLocation(P.comp,'u_thick'),v.thick);
+  gl.uniform1f(gl.getUniformLocation(P.comp,'u_op'),v.op);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null); drawQuad();
+}
+
+/* ---------------- offline API for render.js ---------------- */
+window.HT = {
+  init(w,h,config){
+    if(config){ CFG = Object.assign({}, CFG, config); }
+    setup(w,h);
+    return {PW,PH,cfg:CFG};
+  },
+  // Load a PNG data URL as an image (identical texturing path to the tuner's
+  // image/video upload), run the pipeline, read pixels back, flip to top-down,
+  // and return a PNG data URL for Node to write.
+  process(dataURL){
+    return new Promise((resolve,reject)=>{
+      const img=new Image();
+      img.onload=()=>{
+        try{
+          uploadSource(img);
+          pipeline();
+          const w=PW, h=PH;
+          const pix=new Uint8Array(w*h*4);
+          // Composite drew to the default framebuffer.
+          gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+          gl.readPixels(0,0,w,h,gl.RGBA,gl.UNSIGNED_BYTE,pix);
+          // readPixels is bottom-up; flip to top-down for PNG.
+          const out=document.createElement('canvas'); out.width=w; out.height=h;
+          const ctx=out.getContext('2d');
+          const id=ctx.createImageData(w,h);
+          const dst=id.data;
+          for(let y=0;y<h;y++){
+            const srcRow=(h-1-y)*w*4;
+            const dstRow=y*w*4;
+            dst.set(pix.subarray(srcRow,srcRow+w*4), dstRow);
+          }
+          ctx.putImageData(id,0,0);
+          resolve(out.toDataURL('image/png'));
+        }catch(e){ reject(e); }
+      };
+      img.onerror=()=>reject(new Error('Failed to load frame image in page.'));
+      img.src=dataURL;
+    });
+  }
+};
+window.__HT_READY=true;
+</script>
+</body>
+</html>

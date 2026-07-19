@@ -1,10 +1,13 @@
 <#
-    apply-comic.ps1 — Halftone comic-stylization worker.
+    apply-comic.ps1 — Halftone comic-stylization worker (EXACT-match renderer).
 
     Usage:  powershell -NoProfile -ExecutionPolicy Bypass -File apply-comic.ps1 "C:\path\to\video.mp4"
 
-    Applies the Halftone comic-stylization ffmpeg preset to the input video and
-    writes "<name>_comic.mp4" next to the original. Runs entirely locally.
+    Runs the video through the SAME WebGL pipeline as the "Halftone" tuner web app
+    (renderer/render.js + renderer/renderer.html) and writes "<name>_comic.mp4"
+    next to the original. The output look is pixel-faithful to the tuner's
+    on-screen preview — this replaces the older ffmpeg-only approximation, which
+    produced flatter/cooler tones than the tuner. Runs entirely locally.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -37,49 +40,53 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     Pause-Exit 1
 }
 
-# --- Compute output path ----------------------------------------------------
-$item    = Get-Item -LiteralPath $in
-$dir     = $item.DirectoryName
-$base    = [System.IO.Path]::GetFileNameWithoutExtension($item.Name)
-$out     = Join-Path $dir ($base + '_comic.mp4')
+# --- Validate node is available ---------------------------------------------
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+    Write-Host 'ERROR: Node.js (node) was not found on your PATH.' -ForegroundColor Red
+    Write-Host ''
+    Write-Host 'The exact-match renderer runs on Node.js. Please install it, then try again.'
+    Write-Host '  - Download:  https://nodejs.org/'
+    Write-Host '  - Or run:    winget install OpenJS.NodeJS.LTS'
+    Pause-Exit 1
+}
 
+# --- Locate the renderer ----------------------------------------------------
+$renderer = Join-Path $PSScriptRoot 'renderer\render.js'
+if (-not (Test-Path -LiteralPath $renderer -PathType Leaf)) {
+    Write-Host "ERROR: Could not find the renderer at $renderer" -ForegroundColor Red
+    Pause-Exit 1
+}
+
+# One-time dependency check: node_modules must exist (from `npm install`).
+$nodeModules = Join-Path $PSScriptRoot 'renderer\node_modules\puppeteer'
+if (-not (Test-Path -LiteralPath $nodeModules -PathType Container)) {
+    Write-Host 'ERROR: The renderer''s dependencies are not installed yet.' -ForegroundColor Red
+    Write-Host ''
+    Write-Host 'Run this one-time setup in a terminal:'
+    Write-Host ('    cd "' + (Join-Path $PSScriptRoot 'renderer') + '"')
+    Write-Host '    npm install'
+    Pause-Exit 1
+}
+
+$item = Get-Item -LiteralPath $in
 Write-Host "Input:  $($item.FullName)"
-Write-Host "Output: $out"
-Write-Host ''
-Write-Host 'Applying Halftone comic style... (this can take a while)'
+Write-Host 'Applying Halftone comic style (exact tuner match)... (this can take a while)'
 Write-Host ''
 
-# --- The exact Halftone preset ----------------------------------------------
-# $graph is the -filter_complex VALUE only (no surrounding quotes). It is passed
-# to ffmpeg as a SINGLE argv element via the argument array below, so the single
-# quotes and commas inside it are preserved literally.
-$graph = "[0:v]scale=iw*2:ih*2:flags=lanczos,eq=saturation=1.60:contrast=1.55,bilateral=sigmaS=30:sigmaR=0.1,bilateral=sigmaS=30:sigmaR=0.1,split[f1][f2];[f1]lutyuv=y='floor(val/21)*21':u='round((val-128)/21)*21+128':v='round((val-128)/21)*21+128'[base];[f2]edgedetect=low=0.40:high=0.93,negate,erosion,format=yuv420p[edges];[base][edges]blend=all_mode=multiply:c0_opacity=0.85:c1_opacity=0:c2_opacity=0,scale=iw/2:ih/2:flags=lanczos[out]"
-
-$ffArgs = @(
-    '-y',
-    '-i', $item.FullName,
-    '-filter_complex', $graph,
-    '-map', '[out]',
-    '-map', '0:a?',
-    '-c:v', 'libx264',
-    '-crf', '18',
-    '-preset', 'medium',
-    '-pix_fmt', 'yuv420p',
-    '-c:a', 'copy',
-    $out
-)
-
-& ffmpeg @ffArgs
+# --- Run the exact-match renderer -------------------------------------------
+& node $renderer $item.FullName
 $code = $LASTEXITCODE
 
 Write-Host ''
 if ($code -ne 0) {
-    Write-Host "ERROR: ffmpeg exited with code $code. The output may be incomplete." -ForegroundColor Red
+    Write-Host "ERROR: renderer exited with code $code. The output may be incomplete." -ForegroundColor Red
     Pause-Exit $code
 }
 
+$base = [System.IO.Path]::GetFileNameWithoutExtension($item.Name)
+$out  = Join-Path $item.DirectoryName ($base + '_comic.mp4')
 if (-not (Test-Path -LiteralPath $out -PathType Leaf)) {
-    Write-Host 'ERROR: ffmpeg reported success but the output file was not created.' -ForegroundColor Red
+    Write-Host 'ERROR: renderer reported success but the output file was not created.' -ForegroundColor Red
     Pause-Exit 1
 }
 

@@ -1,0 +1,21 @@
+# Never commit media
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.m4v
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+
+# Temp / editor / OS cruft
+*.tmp
+*.log
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*~

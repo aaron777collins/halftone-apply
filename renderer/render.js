@@ -41,12 +41,13 @@ const MAXW = 1100; // must match the tuner's resize() cap exactly.
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v']);
 
 // ---- puppeteer (bundled Chromium), with puppeteer-core fallback ------------
+// Returns the puppeteer module and whether it's the full package (bundled
+// Chromium) or puppeteer-core (needs an explicit executablePath).
 function loadPuppeteer() {
   try {
     const puppeteer = require('puppeteer');
-    return { puppeteer, launchOpts: {}, which: 'puppeteer (bundled Chromium)' };
+    return { puppeteer, isCore: false, which: 'puppeteer (bundled Chromium)' };
   } catch (e) {
-    // Fall back to puppeteer-core + an installed Chrome.
     let core;
     try { core = require('puppeteer-core'); }
     catch (e2) {
@@ -57,11 +58,10 @@ function loadPuppeteer() {
         '    npm install\n'
       );
     }
-    const chrome = findChrome();
-    if (!chrome) {
+    if (!findChrome()) {
       fail('puppeteer-core is present but no installed Chrome was found. Run `npm install` (for bundled Chromium) or install Google Chrome.');
     }
-    return { puppeteer: core, launchOpts: { executablePath: chrome }, which: 'puppeteer-core + ' + chrome };
+    return { puppeteer: core, isCore: true, which: 'puppeteer-core + installed Chrome' };
   }
 }
 
@@ -78,6 +78,128 @@ function findChrome() {
 function fail(msg) {
   console.error('\nERROR: ' + msg + '\n');
   process.exit(1);
+}
+
+// ===========================================================================
+// GPU launch configs + auto-detection.
+//
+// Chrome 137+ dropped the automatic SwiftShader fallback and, on laptops with
+// switchable graphics (NVIDIA Optimus), ANGLE's d3d11 backend defaults to the
+// low-power integrated GPU. The KEY flag that engages the discrete NVIDIA GPU
+// is `--force-high-performance-gpu`; `--use-angle=d3d11 --enable-gpu
+// --ignore-gpu-blocklist` turn on real hardware WebGL in the first place.
+//
+// We try configs in priority order and keep the FIRST that reports a HARDWARE
+// renderer string, falling back to SwiftShader software so the tool still runs
+// on a machine with no usable GPU.
+// ===========================================================================
+const BASE_ARGS  = ['--no-sandbox', '--disable-dev-shm-usage'];
+const GPU_ARGS   = ['--use-angle=d3d11', '--enable-gpu', '--ignore-gpu-blocklist', '--force-high-performance-gpu'];
+const OFFSCREEN  = ['--window-position=-3000,-3000', '--window-size=1280,720'];
+const SWIFT_ARGS = ['--enable-unsafe-swiftshader', '--use-gl=angle', '--use-angle=swiftshader', '--ignore-gpu-blocklist'];
+
+// Build the ordered list of GPU launch configs to try. `chrome` is the path to
+// an installed Chrome (or null if none found).
+function gpuConfigs(isCore, chrome) {
+  const list = [];
+  // Bundled Chromium (skipped when only puppeteer-core is available).
+  if (!isCore) {
+    list.push({ name: 'bundled-headless', launch: { headless: true,  args: [...BASE_ARGS, ...GPU_ARGS] } });
+    list.push({ name: 'bundled-headful',  launch: { headless: false, args: [...BASE_ARGS, ...GPU_ARGS, ...OFFSCREEN] } });
+  }
+  // Installed Chrome (usually the most reliable GPU drivers).
+  if (chrome) {
+    list.push({ name: 'chrome-headless', launch: { headless: true,  executablePath: chrome, args: [...BASE_ARGS, ...GPU_ARGS] } });
+    list.push({ name: 'chrome-headful',  launch: { headless: false, executablePath: chrome, args: [...BASE_ARGS, ...GPU_ARGS, ...OFFSCREEN] } });
+  }
+  return list;
+}
+
+function softwareConfig(isCore, chrome) {
+  const launch = { headless: true, args: [...BASE_ARGS, ...SWIFT_ARGS] };
+  if (isCore && chrome) launch.executablePath = chrome;
+  return { name: 'software-swiftshader', launch };
+}
+
+// Classify a WebGL UNMASKED_RENDERER_WEBGL string.
+function classifyRenderer(r) {
+  if (!r) return 'UNKNOWN';
+  const s = String(r).toLowerCase();
+  if (s.includes('swiftshader') || s.includes('software') || s.includes('llvmpipe') || s.includes('basic render'))
+    return 'SOFTWARE';
+  if (s.includes('nvidia') || s.includes('geforce') || s.includes('rtx') || s.includes('radeon') ||
+      s.includes('amd') || s.includes('intel') || s.includes('direct3d11') || s.includes('metal') ||
+      s.includes('opengl'))
+    return 'HARDWARE';
+  return 'UNKNOWN';
+}
+
+// Launch a browser with a given config, load renderer.html, and read the live
+// WebGL renderer string. Returns { browser, page, info } or throws.
+async function launchAndProbe(puppeteer, launch) {
+  const browser = await puppeteer.launch(launch);
+  try {
+    const page = await browser.newPage();
+    page.on('pageerror', e => console.error('      [page error] ' + e.message));
+    const htmlPath = 'file://' + path.join(__dirname, 'renderer.html').replace(/\\/g, '/');
+    await page.goto(htmlPath, { waitUntil: 'load' });
+    await page.waitForFunction('window.__HT_READY === true', { timeout: 20000 });
+    const info = await page.evaluate(() => window.HT.glinfo());
+    return { browser, page, info };
+  } catch (e) {
+    try { await browser.close(); } catch (e2) {}
+    throw e;
+  }
+}
+
+// Acquire a ready browser + page using the best available config.
+// opts.cpu forces software; opts['gpu-mode'] forces a named config for
+// debugging. Returns { browser, page, mode, renderer, hardware }.
+async function acquireBrowser(puppeteer, isCore, chrome, opts) {
+  const forceCpu  = !!opts.cpu || String(process.env.HALFTONE_GPU || '').toLowerCase() === 'cpu';
+  const forceMode = opts['gpu-mode'] || process.env.HALFTONE_GPU_MODE || null;
+
+  const sw = softwareConfig(isCore, chrome);
+
+  if (forceCpu) {
+    console.log('GPU: forced software (SwiftShader) via --cpu/HALFTONE_GPU=cpu.');
+    const r = await launchAndProbe(puppeteer, sw.launch);
+    console.log('     renderer: ' + r.info.renderer);
+    return { browser: r.browser, page: r.page, mode: sw.name, renderer: r.info.renderer, hardware: false };
+  }
+
+  let candidates = gpuConfigs(isCore, chrome);
+  if (forceMode) {
+    const all = [...candidates, sw];
+    const picked = all.find(c => c.name === forceMode);
+    if (!picked) fail('Unknown --gpu-mode "' + forceMode + '". Valid: ' + all.map(c => c.name).join(', '));
+    console.log('GPU: forced mode "' + forceMode + '".');
+    const r = await launchAndProbe(puppeteer, picked.launch);
+    console.log('     renderer: ' + r.info.renderer + '  [' + classifyRenderer(r.info.renderer) + ']');
+    return { browser: r.browser, page: r.page, mode: picked.name, renderer: r.info.renderer,
+             hardware: classifyRenderer(r.info.renderer) === 'HARDWARE' };
+  }
+
+  console.log('GPU: auto-detecting hardware WebGL...');
+  for (const cfg of candidates) {
+    try {
+      const r = await launchAndProbe(puppeteer, cfg.launch);
+      const cls = classifyRenderer(r.info.renderer);
+      console.log('     [' + cfg.name + '] ' + cls + '  ' + r.info.renderer);
+      if (cls === 'HARDWARE') {
+        console.log('GPU: engaged hardware WebGL via "' + cfg.name + '".');
+        return { browser: r.browser, page: r.page, mode: cfg.name, renderer: r.info.renderer, hardware: true };
+      }
+      try { await r.browser.close(); } catch (e) {}
+    } catch (e) {
+      console.log('     [' + cfg.name + '] launch failed: ' + ((e && e.message) || e));
+    }
+  }
+
+  console.warn('GPU: WARNING — no config engaged the GPU; falling back to SwiftShader software (slow).');
+  const r = await launchAndProbe(puppeteer, sw.launch);
+  console.log('     renderer: ' + r.info.renderer);
+  return { browser: r.browser, page: r.page, mode: sw.name, renderer: r.info.renderer, hardware: false };
 }
 
 // ---- tiny arg parser -------------------------------------------------------
@@ -259,30 +381,21 @@ async function renderOne(page, inItem, out, cfg, label) {
               ' lev=' + cfg.lev + ' thr=' + cfg.thr + ' thick=' + cfg.thick + ' op=' + cfg.op + ' edges=' + cfg.edges);
   console.log('');
 
-  // Launch ONE Chromium + WebGL context, reused across every file.
-  const { puppeteer, launchOpts, which } = loadPuppeteer();
+  // Launch ONE Chromium + WebGL context, reused across every file. Auto-detect
+  // the best GPU config once; renderer.html is already loaded on the returned
+  // page (its WebGL context was probed during detection).
+  const { puppeteer, isCore, which } = loadPuppeteer();
+  const chrome = findChrome();
   console.log('Engine: ' + which);
-  const browser = await puppeteer.launch(Object.assign({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--enable-unsafe-swiftshader',
-      '--use-gl=angle',
-      '--use-angle=swiftshader',
-      '--ignore-gpu-blocklist',
-    ],
-  }, launchOpts));
+  const acq = await acquireBrowser(puppeteer, isCore, chrome, opts);
+  const browser = acq.browser;
+  const page = acq.page;
+  console.log('Renderer: ' + acq.renderer + '   (' + (acq.hardware ? 'HARDWARE GPU' : 'SOFTWARE') + ', mode=' + acq.mode + ')');
+  console.log('');
 
   let processed = 0;
   const failures = [];
   try {
-    const page = await browser.newPage();
-    page.on('pageerror', e => console.error('      [page error] ' + e.message));
-    const htmlPath = 'file://' + path.join(__dirname, 'renderer.html').replace(/\\/g, '/');
-    await page.goto(htmlPath, { waitUntil: 'load' });
-    await page.waitForFunction('window.__HT_READY === true', { timeout: 20000 });
-
     for (let i = 0; i < jobs.length; i++) {
       const job = jobs[i];
       const label = '[' + (i + 1) + '/' + jobs.length + '] ';

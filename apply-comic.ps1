@@ -53,7 +53,7 @@ Write-Host ''
 # $graph is the -filter_complex VALUE only (no surrounding quotes). It is passed
 # to ffmpeg as a SINGLE argv element via the argument array below, so the single
 # quotes and commas inside it are preserved literally.
-$graph = "[0:v]scale=iw*2:ih*2:flags=lanczos,eq=saturation=2.60:contrast=1.35,bilateral=sigmaS=30:sigmaR=0.1,bilateral=sigmaS=30:sigmaR=0.1,split[f1][f2];[f1]lutyuv=y='floor(val/51)*51':u='round((val-128)/51)*51+128':v='round((val-128)/51)*51+128'[base];[f2]edgedetect=low=0.40:high=0.93,negate,erosion,format=yuv420p[edges];[base][edges]blend=all_mode=multiply:c0_opacity=0.85:c1_opacity=0:c2_opacity=0,scale=iw/2:ih/2:flags=lanczos[out]"
+$graph = "[0:v]scale=iw*2:ih*2:flags=lanczos,eq=saturation=1.60:contrast=1.55,bilateral=sigmaS=30:sigmaR=0.1,bilateral=sigmaS=30:sigmaR=0.1,split[f1][f2];[f1]lutyuv=y='floor(val/21)*21':u='round((val-128)/21)*21+128':v='round((val-128)/21)*21+128'[base];[f2]edgedetect=low=0.40:high=0.93,negate,erosion,format=yuv420p[edges];[base][edges]blend=all_mode=multiply:c0_opacity=0.85:c1_opacity=0:c2_opacity=0,scale=iw/2:ih/2:flags=lanczos[out]"
 
 $ffArgs = @(
     '-y',

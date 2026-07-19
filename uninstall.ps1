@@ -8,8 +8,9 @@
 
 $ErrorActionPreference = 'Stop'
 
-$exts    = @('.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v')
-$keyName = 'HalftoneComic'
+$exts          = @('.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v')
+$keyName       = 'HalftoneComic'
+$folderKeyName = 'HalftoneComicFolder'
 
 Write-Host 'Removing Halftone comic context-menu entries (HKCU)...'
 Write-Host ''
@@ -26,9 +27,19 @@ foreach ($ext in $exts) {
     }
 }
 
+# Per-folder verb.
+$folderShellKey = "HKCU:\Software\Classes\Directory\shell\$folderKeyName"
+if (Test-Path -Path $folderShellKey) {
+    Remove-Item -Path $folderShellKey -Recurse -Force
+    Write-Host '  removed    Directory (folder)'
+    $removed++
+} else {
+    Write-Host '  not found  Directory (folder)'
+}
+
 Write-Host ''
 if ($removed -gt 0) {
-    Write-Host "Done. Removed entries for $removed extension(s)." -ForegroundColor Green
+    Write-Host "Done. Removed $removed entr$(if ($removed -eq 1) {'y'} else {'ies'})." -ForegroundColor Green
 } else {
     Write-Host 'Nothing to remove — no entries were found.' -ForegroundColor Yellow
 }

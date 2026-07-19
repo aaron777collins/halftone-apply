@@ -1,10 +1,23 @@
 # Halftone — Right-click "Apply Comic Style" for Windows
 
-Right-click any video file in Windows Explorer, choose **"Apply Comic Style (Halftone)"**,
-and get a comic-stylized copy named `<name>_comic.mp4` written right next to the original.
+Right-click a video **file** and choose **"Apply Comic Style (Halftone)"**, or
+right-click a **folder** and choose **"Comic-style all videos in folder
+(Halftone)"** — either way you get comic-stylized copies named
+`<name>_comic.mp4`.
 
 It's a small, per-user Windows Explorer context-menu integration. No admin rights
 required — it only touches your own user registry hive (`HKCU`).
+
+## Three ways to get the look — pick the right one
+
+| Path | Where | Match | Speed / resolution |
+| --- | --- | --- | --- |
+| **This renderer** (`render.js` / right-click) | desktop, offline | **Exact** — same WebGL shaders as the tuner | Full source resolution; slower (headless Chromium per frame) |
+| **The website tuner** ([index.html](index.html)) | browser | Exact preview; MP4 export is preview-res | Quick, interactive; recording is at preview resolution |
+| **`comicify.sh`** (in the `halftone` repo) | terminal, ffmpeg | **Approximation** — flatter/cooler tones, does *not* match the tuner | Fast, pure ffmpeg |
+
+**This repo is the exact-tuner-match path.** Use it when you want the MP4 to look
+exactly like the tuner preview at full resolution.
 
 ## Exact-match renderer (what you see in the tuner is what you get)
 
@@ -44,6 +57,48 @@ npm install
 You right-click `holiday.mp4` → **Apply Comic Style (Halftone)** → a moment later
 `holiday_comic.mp4` appears in the same folder. That's it.
 
+For a whole folder, right-click it → **Comic-style all videos in folder
+(Halftone)** → every video (`.mp4 .mov .mkv .avi .webm .m4v`, non-recursive) is
+rendered into an `output\` subfolder as `<name>_comic.mp4`.
+
+## Usage
+
+### Right-click (Explorer)
+
+- **A file** → *Apply Comic Style (Halftone)* → writes `<name>_comic.mp4` next to it.
+- **A folder** → *Comic-style all videos in folder (Halftone)* → writes each
+  `<name>_comic.mp4` into an `output\` subfolder of that folder.
+
+### `render-folder.ps1` (double-click friendly)
+
+Batches a folder without installing the right-click menu. Double-click it (it
+shows a folder-picker), or run it with paths:
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File render-folder.ps1 "C:\clips" ["C:\out"]
+```
+
+`$args[0]` is the input folder (omit for a folder-picker, or defaults to the
+current directory); `$args[1]` is an optional output folder (default
+`<input>\output`). It validates node + ffmpeg + `renderer/node_modules/puppeteer`,
+shows progress, and pauses at the end.
+
+### `render.js` CLI (single file or folder)
+
+```
+# Single file  → "<name>_comic.mp4" next to the input (or --out <file>)
+node renderer/render.js "C:\path\to\clip.mp4" [--out out.mp4]
+
+# Folder       → every video → "output\" subfolder (or --out <dir>)
+node renderer/render.js "C:\path\to\folder" [--out "C:\out"]
+```
+
+In folder mode the renderer reuses **one** headless-Chromium/WebGL context
+across all files (it does not relaunch per file), prints per-file progress
+(`[2/7] clip.mp4 → …`) and a final summary; one file failing is logged and the
+batch continues. Common overrides: `--sat 2.0 --con 1.4 --rad 6 --pass 2
+--lev 12 --thr 0.8 --thick 1 --op 0.85 --no-edges`.
+
 ## Prerequisites
 
 - **Windows** (10 or 11).
@@ -74,14 +129,16 @@ Clone or download this repo, then either:
   powershell -ExecutionPolicy Bypass -File install.ps1
   ```
 
-The installer registers the menu entry for these video extensions:
-`.mp4 .mov .mkv .avi .webm .m4v`.
+The installer registers **two** entries:
 
-The context-menu command points at `apply-comic.ps1` using its absolute path
-(resolved from where you cloned the repo), so **keep the repo folder where it is**
-after installing. If you move it, re-run `install.ps1`. `apply-comic.ps1` in turn
-runs `renderer/render.js`, so keep the `renderer/` folder (and its installed
-`node_modules`) alongside it.
+- the per-**file** verb for these video extensions: `.mp4 .mov .mkv .avi .webm .m4v`, and
+- the per-**folder** verb (on any directory) that batches every video inside it.
+
+Both commands point at the workers (`apply-comic.ps1` / `render-folder.ps1`)
+using their absolute paths (resolved from where you cloned the repo), so **keep
+the repo folder where it is** after installing. If you move it, re-run
+`install.ps1`. The workers in turn run `renderer/render.js`, so keep the
+`renderer/` folder (and its installed `node_modules`) alongside them.
 
 ## Uninstall
 
@@ -124,8 +181,9 @@ It only reads the video you pick and writes the `_comic.mp4` next to it.
 
 ## Scope / permissions
 
-- **Per-user, no admin.** Installs and uninstalls modify only `HKCU`
-  (`HKCU:\Software\Classes\SystemFileAssociations\<ext>\shell\HalftoneComic`).
+- **Per-user, no admin.** Installs and uninstalls modify only `HKCU`:
+  - per-file: `HKCU:\Software\Classes\SystemFileAssociations\<ext>\shell\HalftoneComic`
+  - per-folder: `HKCU:\Software\Classes\Directory\shell\HalftoneComicFolder`
 
 ## License
 
